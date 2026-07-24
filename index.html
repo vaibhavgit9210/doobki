@@ -519,7 +519,7 @@ reset();
 const m = /t=([\d.]+)/.exec(location.hash);
 if (m){ seek(+m[1]);
   document.getElementById('hint').textContent =
-    `t=${t.toFixed(2)} pose=${man.pose} ang=${man.ang.toFixed(2)} y=${man.y.toFixed(0)} ph=${phase}`; }
+    `rt=${rt.toFixed(2)} t=${t.toFixed(2)} pose=${man.pose} ang=${man.ang.toFixed(2)} y=${man.y.toFixed(0)} ph=${phase}`; }
 requestAnimationFrame(frame);
 </script>
 <script>
