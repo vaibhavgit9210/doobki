@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Freefall</title>
+<style>
+  html,body{margin:0;height:100%;background:#03161f;overflow:hidden}
+  canvas{display:block;width:100vw;height:100vh}
+  #hint{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);
+        font:10px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:.2em;
+        text-transform:uppercase;color:#fff;opacity:.28;pointer-events:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">click to replay</div>
+<script>
+const c = document.getElementById('c'), ctx = c.getContext('2d');
+
+const VH = 800;                 // world units visible vertically
+let dpr = 1, cw = 0, ch = 0, scale = 1, VW = 800;
+
+function resize(){
+  dpr = Math.min(2, window.devicePixelRatio || 1);
+  cw = innerWidth; ch = innerHeight;
+  c.width = Math.round(cw * dpr); c.height = Math.round(ch * dpr);
+  scale = ch / VH; VW = cw / scale;
+}
+addEventListener('resize', resize);
+resize();
+
+const SIL = '#14232f';
+const SIL_DEEP = '#2a4657';      // keeps the silhouette readable once the water goes dark
+let silNow = SIL;
+const lerp = (a,b,k) => a + (b-a)*k;
+function mix(a, b, k){
+  const p = h => [1,3,5].map(i => parseInt(h.substr(i,2),16));
+  const A = p(a), B = p(b);
+  return `rgb(${A.map((v,i)=>Math.round(lerp(v,B[i],k))).join(',')})`;
+}
+const clamp = (v,a,b) => v < a ? a : v > b ? b : v;
+const rnd = (a,b) => a + Math.random()*(b-a);
+
+/* ---------- scene contents ---------- */
+
+function makeClouds(){
+  const out = [];
+  for (let y = -2380; y < -180; y += rnd(150, 300)){
+    out.push({ x: rnd(-700, 700), y, s: rnd(0.7, 1.9), a: rnd(0.5, 0.95) });
+  }
+  return out;
+}
+function makeSnow(){
+  const out = [];
+  for (let i = 0; i < 220; i++){
+    out.push({ x: rnd(-1300,1300), y: rnd(-40, 3200), r: rnd(0.5,1.9), a: rnd(0.12,0.5), ph: rnd(0,7) });
+  }
+  return out;
+}
+
+let S;
+function reset(){
+  S = {
+    tr: 0, tw: 0, phase: 'fall', fade: 1, ending: 0,
+    man: { x: 0, y: -2280, v: 0, rot: -0.3, pose: null },
+    cam: 0, clouds: makeClouds(), snow: makeSnow(),
+    bubbles: [], drops: [], rings: [], splash: null, disturb: 0,
+    streamline: 0, sink: 0
+  };
+  S.cam = S.man.y - VH*0.38;
+}
+reset();
+
+/* ---------- water surface ---------- */
+
+function waveAt(x, t){
+  return Math.sin(x*0.011 + t*1.15)*2.4
+       + Math.sin(x*0.028 - t*1.9)*1.3
+       + (S.disturb > 0.001
+            ? Math.sin(x*0.09 - S.tw*9)*S.disturb*9 * Math.exp(-Math.abs(x - S.man.x)/160)
+            : 0);
+}
+
+function waterPath(){
+  const t = S.tr, x0 = -VW/2 - 20, x1 = VW/2 + 20;
+  ctx.beginPath();
+  ctx.moveTo(x0, waveAt(x0, t) - S.cam);
+  for (let x = x0; x <= x1; x += 8) ctx.lineTo(x, waveAt(x, t) - S.cam);
+  ctx.lineTo(x1, VH + 40); ctx.lineTo(x0, VH + 40);
+  ctx.closePath();
+}
+
+/* ---------- figure ---------- */
+
+const POSE_FLAIL = { armL:[-2.35,-0.5], armR:[2.35,0.5], legL:[-0.42,-0.25], legR:[0.42,0.28] };
+const POSE_LINE  = { armL:[-0.22,-0.08], armR:[0.22,0.08], legL:[-0.07,-0.03], legR:[0.07,0.03] };
+const POSE_SINK  = { armL:[-2.25,-0.55], armR:[2.35,0.5], legL:[-0.34,0.5], legR:[0.3,-0.45] };
+
+function blend(A, B, k){
+  const o = {};
+  for (const key in A) o[key] = [lerp(A[key][0], B[key][0], k), lerp(A[key][1], B[key][1], k)];
+  return o;
+}
+function flutter(p, amp, t){
+  const o = {};
+  for (const key in p){
+    const s = key[0] === 'a' ? 1 : 0.65, d = key[3] === 'L' ? 0 : Math.PI*0.7;
+    o[key] = [p[key][0] + Math.sin(t*4.2 + d)*amp*s, p[key][1] + Math.cos(t*3.1 + d)*amp*s*0.8];
+  }
+  return o;
+}
+
+function limb(ox, oy, l1, l2, a1, a2, w){
+  const x1 = ox + Math.sin(a1)*l1, y1 = oy + Math.cos(a1)*l1;
+  const x2 = x1 + Math.sin(a2)*l2, y2 = y1 + Math.cos(a2)*l2;
+  ctx.lineWidth = w;
+  ctx.beginPath(); ctx.moveTo(ox, oy); ctx.lineTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+}
+
+function drawMan(x, y, rot, p){
+  ctx.save();
+  ctx.translate(x, y); ctx.rotate(rot);
+  ctx.strokeStyle = silNow; ctx.fillStyle = silNow;
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  limb(0, 3.5, 9.5, 9.5, p.legL[0], p.legL[1], 4.2);
+  limb(0, 3.5, 9.5, 9.5, p.legR[0], p.legR[1], 4.2);
+  ctx.lineWidth = 6.6;
+  ctx.beginPath(); ctx.moveTo(0, -6); ctx.lineTo(0, 3.5); ctx.stroke();
+  limb(0, -5.5, 8, 8, p.armL[0], p.armL[1], 3.6);
+  limb(0, -5.5, 8, 8, p.armR[0], p.armR[1], 3.6);
+  ctx.beginPath(); ctx.arc(0, -11.6, 4.3, 0, 7); ctx.fill();
+  ctx.restore();
+}
+
+/* ---------- impact ---------- */
+
+function impact(){
+  S.phase = 'water'; S.tw = 0; S.disturb = 1;
+  S.man.v *= 0.55;
+  S.splash = { t: 0, x: S.man.x, spikes: [] };
+  for (let i = 0; i < 11; i++){
+    S.splash.spikes.push({ dx: rnd(-26,26), a: rnd(-0.75,0.75), len: rnd(26,62), w: rnd(3,8) });
+  }
+  for (let i = 0; i < 30; i++){
+    const a = rnd(-1.35, 1.35), sp = rnd(90, 330);
+    S.drops.push({ x: S.man.x + rnd(-10,10), y: -4, vx: Math.sin(a)*sp, vy: -Math.cos(a)*sp*rnd(0.7,1.2), r: rnd(1.1,3.2) });
+  }
+  for (let i = 0; i < 3; i++) S.rings.push({ t: -i*0.18, x: S.man.x });
+  for (let i = 0; i < 46; i++){
+    S.bubbles.push({ x: S.man.x + rnd(-30,30), y: rnd(10, 130), r: rnd(1,4.6), vy: rnd(22,70), ph: rnd(0,7) });
+  }
+}
+
+/* ---------- physics ---------- */
+
+function step(dtr){
+  S.tr += dtr;
+
+  // slow-motion ramp once underwater
+  // hard slow-mo through the plunge, then easing back for the long drift down
+  let ts = 1;
+  if (S.phase === 'water'){
+    ts = S.tw < 1.8 ? 0.3 : lerp(0.3, 0.9, clamp((S.tw - 1.8)/3.2, 0, 1));
+  }
+  const dt = dtr * ts;
+  if (S.phase === 'water') S.tw += dtr;
+
+  const m = S.man;
+
+  if (S.phase === 'fall'){
+    m.v = Math.min(m.v + 980*dt, 720);
+    m.y += m.v*dt;
+    m.x = Math.sin(S.tr*0.5)*14;
+    S.streamline = clamp((m.y + 560)/430, 0, 1);
+    const tumble = (0.55*Math.sin(S.tr*1.7) - 0.2);
+    const target = lerp(tumble, 0.02, S.streamline);
+    m.rot = lerp(m.rot, target, clamp(dt*3.2, 0, 1));
+    if (m.y + 16 >= waveAt(m.x, S.tr)) impact();
+  } else {
+    const vSink = 155;                                  // steady, dreamy sink rate
+    m.v = vSink + (m.v - vSink)*Math.exp(-1.3*dt);
+    m.y += m.v*dt;
+    m.x += Math.sin(S.tw*0.35)*5*dt;
+    S.sink = clamp(S.sink + dt*1.4, 0, 1);
+    m.rot = lerp(m.rot, 0.09 + 0.16*Math.sin(S.tw*0.32), clamp(dt*1.6, 0, 1));
+    S.disturb *= Math.exp(-1.6*dtr);
+    // trailing bubbles
+    if (Math.random() < dtr*14 && S.bubbles.length < 240){
+      S.bubbles.push({ x: m.x + rnd(-7,7), y: m.y + rnd(-8,8), r: rnd(0.7,2.6), vy: rnd(14,40), ph: rnd(0,7) });
+    }
+  }
+
+  // pose
+  let p = blend(flutter(POSE_FLAIL, 0.22*(1-S.streamline), S.tr), POSE_LINE, S.streamline);
+  if (S.phase === 'water'){
+    const drift = flutter(POSE_SINK, 0.1, S.tw*0.35);
+    p = blend(p, drift, S.sink);
+  }
+  m.pose = p;
+
+  // camera: tight on the fall, laggy and slow on the descent
+  const target = m.y - VH*(S.phase === 'fall' ? 0.38 : 0.42);
+  S.cam = lerp(S.cam, target, clamp(dtr*(S.phase === 'fall' ? 6 : 1.1), 0, 1));
+
+  // particles
+  if (S.splash) { S.splash.t += dt; if (S.splash.t > 1.1) S.splash = null; }
+  for (const r of S.rings) r.t += dt;
+  S.rings = S.rings.filter(r => r.t < 2.2);
+
+  for (const d of S.drops){
+    d.vy += 900*dt; d.x += d.vx*dt; d.y += d.vy*dt; d.vx *= Math.exp(-0.5*dt);
+  }
+  S.drops = S.drops.filter(d => d.y < waveAt(d.x, S.tr) + 2 || d.vy < 0);
+
+  for (const b of S.bubbles){
+    b.y -= b.vy*dt; b.x += Math.sin(b.ph + S.tr*2.4)*10*dt; b.vy += 6*dt;
+  }
+  S.bubbles = S.bubbles.filter(b => b.y > waveAt(b.x, S.tr) + 1);
+
+  for (const s of S.snow) s.y += 5*dt;
+
+  // fade in / loop out
+  S.fade = Math.max(0, S.fade - dtr*1.4);
+  if (S.phase === 'water' && S.tw > 12.5){
+    S.ending += dtr;
+    S.fade = Math.min(1, S.ending/1.4);
+    if (S.ending > 1.5) reset();
+  }
+}
+
+/* ---------- render ---------- */
+
+function draw(){
+  ctx.setTransform(dpr*scale, 0, 0, dpr*scale, cw*dpr/2, 0);
+  const L = -VW/2, surf = -S.cam;
+  const depth = Math.max(0, S.cam + VH*0.5);
+  const above = clamp(1 - depth/500, 0, 1);   // how much sky is still relevant
+
+  // sky
+  let g = ctx.createLinearGradient(0, 0, 0, VH);
+  g.addColorStop(0, '#8fd0f5'); g.addColorStop(0.55, '#bfe6fb'); g.addColorStop(1, '#e6f6fe');
+  ctx.fillStyle = g; ctx.fillRect(L, 0, VW, VH);
+
+  // sun (screen-anchored)
+  if (above > 0){
+    ctx.save(); ctx.globalAlpha = 0.5*above;
+    const sx = L + VW*0.78, sy = VH*0.13;
+    const sg = ctx.createRadialGradient(sx, sy, 4, sx, sy, 110);
+    sg.addColorStop(0, 'rgba(255,255,255,0.95)'); sg.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = sg; ctx.beginPath(); ctx.arc(sx, sy, 110, 0, 7); ctx.fill();
+    ctx.restore();
+  }
+
+  // clouds
+  ctx.fillStyle = '#ffffff';
+  for (const cl of S.clouds){
+    const y = cl.y - S.cam;
+    if (y < -180 || y > VH + 180) continue;
+    ctx.save(); ctx.globalAlpha = cl.a*0.9; ctx.translate(cl.x, y); ctx.scale(cl.s, cl.s*0.62);
+    ctx.beginPath();
+    ctx.arc(-34, 6, 20, 0, 7); ctx.arc(-4, -8, 28, 0, 7);
+    ctx.arc(30, 4, 22, 0, 7); ctx.arc(58, 10, 15, 0, 7);
+    ctx.fill(); ctx.restore();
+  }
+
+  // water body
+  ctx.save();
+  waterPath(); ctx.clip();
+  const wg = ctx.createLinearGradient(0, surf, 0, surf + 1250);
+  wg.addColorStop(0,    '#52bcd4');
+  wg.addColorStop(0.07, '#2b93b1');
+  wg.addColorStop(0.26, '#13607f');
+  wg.addColorStop(0.55, '#093551');
+  wg.addColorStop(1,    '#03151f');
+  ctx.fillStyle = wg; ctx.fillRect(L, Math.min(0, surf), VW, VH + Math.abs(Math.min(0, surf)) + 40);
+
+  // far-surface sheen just below the waterline
+  if (surf > -60 && surf < VH + 40){
+    ctx.globalAlpha = 0.22; ctx.fillStyle = '#bfeefc';
+    ctx.fillRect(L, surf, VW, 7);
+    ctx.globalAlpha = 0.1; ctx.fillRect(L, surf + 7, VW, 22);
+    ctx.globalAlpha = 1;
+  }
+
+  // light shafts from the surface
+  if (surf > -700){
+    const reach = 760;
+    for (let i = 0; i < 6; i++){
+      const bx = L + ((i*241 + Math.sin(S.tr*0.2 + i*1.7)*50 + 120) % (VW + 240)) - 120;
+      const w = 16 + (i % 3)*14, lean = 90;
+      const sg = ctx.createLinearGradient(0, surf, 0, surf + reach);
+      sg.addColorStop(0, 'rgba(214,244,255,0.16)');
+      sg.addColorStop(0.35, 'rgba(214,244,255,0.06)');
+      sg.addColorStop(1, 'rgba(214,244,255,0)');
+      ctx.fillStyle = sg;
+      ctx.beginPath();
+      ctx.moveTo(bx, surf); ctx.lineTo(bx + w, surf);
+      ctx.lineTo(bx + w + lean + w*2.2, surf + reach); ctx.lineTo(bx + lean, surf + reach);
+      ctx.closePath(); ctx.fill();
+    }
+  }
+
+  ctx.globalAlpha = 1;
+  ctx.restore();
+
+  // depth grade + vignette (water only) — under the figure so it stays readable
+  const dk = clamp(depth/1050, 0, 1);
+  if (dk > 0.001){
+    ctx.save(); waterPath(); ctx.clip();
+    ctx.globalAlpha = 0.86*dk; ctx.fillStyle = '#03111a';
+    ctx.fillRect(L, -10, VW, VH + 20);   // clip already stops it at the surface
+    ctx.globalAlpha = 0.55*dk;
+    const vg = ctx.createRadialGradient(0, VH*0.5, VH*0.16, 0, VH*0.5, VH*0.82);
+    vg.addColorStop(0, 'rgba(3,18,26,0)'); vg.addColorStop(1, 'rgba(3,18,26,1)');
+    ctx.fillStyle = vg; ctx.fillRect(L, 0, VW, VH);
+    ctx.restore();
+  }
+
+  // marine snow — over the grade so the drift still reads in the dark
+  ctx.save(); waterPath(); ctx.clip();
+  ctx.fillStyle = '#d8f2ff';
+  for (const s of S.snow){
+    const y = s.y - S.cam;
+    if (y < -20 || y > VH + 20) continue;
+    ctx.globalAlpha = s.a * (0.35 + 0.65*Math.abs(Math.sin(s.ph + S.tr*0.6))) * (1 - 0.45*dk);
+    ctx.beginPath(); ctx.arc(s.x, y, s.r, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+
+  // the man
+  silNow = dk > 0.01 ? mix(SIL, SIL_DEEP, dk) : SIL;
+  drawMan(S.man.x, S.man.y - S.cam, S.man.rot, S.man.pose);
+
+  // bubbles
+  ctx.strokeStyle = '#e8fbff';
+  const bDim = 1 - 0.5*dk;
+  for (const b of S.bubbles){
+    const y = b.y - S.cam;
+    if (y < -20 || y > VH + 20) continue;
+    ctx.globalAlpha = 0.42*bDim;
+    ctx.lineWidth = 0.9;
+    ctx.beginPath(); ctx.arc(b.x, y, b.r, 0, 7); ctx.stroke();
+    ctx.globalAlpha = 0.16*bDim; ctx.fillStyle = '#ffffff';
+    ctx.beginPath(); ctx.arc(b.x, y, b.r, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // splash: rings, crown, column, droplets
+  if (surf > -160 && surf < VH + 160){
+    ctx.save();
+    for (const r of S.rings){
+      if (r.t < 0) continue;
+      const k = r.t/2.2;
+      ctx.globalAlpha = 0.5*(1-k)*(1-k);
+      ctx.strokeStyle = '#eafaff'; ctx.lineWidth = 1.6*(1-k) + 0.5;
+      ctx.beginPath(); ctx.ellipse(r.x, surf + 3, 16 + 300*k, (16 + 300*k)*0.1, 0, 0, 7); ctx.stroke();
+    }
+    if (S.splash){
+      const t = S.splash.t, k = clamp(t/0.9, 0, 1), rise = Math.sin(Math.PI*Math.min(1, t/0.75));
+      ctx.fillStyle = '#f2fdff';
+
+      // foam disc
+      ctx.globalAlpha = 0.75*(1-k);
+      ctx.beginPath(); ctx.ellipse(S.splash.x, surf + 2, 16 + 96*k, (16 + 96*k)*0.14, 0, 0, 7); ctx.fill();
+
+      // crown spikes
+      ctx.globalAlpha = 0.9*(1-k);
+      for (const sp of S.splash.spikes){
+        const len = sp.len*rise, bx = S.splash.x + sp.dx;
+        ctx.beginPath();
+        ctx.moveTo(bx - sp.w/2, surf + 4);
+        ctx.lineTo(bx + Math.sin(sp.a)*len, surf - len);
+        ctx.lineTo(bx + sp.w/2, surf + 4);
+        ctx.closePath(); ctx.fill();
+      }
+
+      // central column
+      ctx.globalAlpha = 0.95*(1-k*0.9);
+      const h = 78*rise, w = lerp(15, 7, k);
+      ctx.beginPath();
+      ctx.moveTo(S.splash.x - w, surf + 6);
+      ctx.quadraticCurveTo(S.splash.x - w*0.6, surf - h, S.splash.x, surf - h - 6);
+      ctx.quadraticCurveTo(S.splash.x + w*0.6, surf - h, S.splash.x + w, surf + 6);
+      ctx.closePath(); ctx.fill();
+    }
+    ctx.globalAlpha = 0.9; ctx.fillStyle = '#f2fdff';
+    for (const d of S.drops){
+      ctx.beginPath(); ctx.arc(d.x, d.y - S.cam, d.r, 0, 7); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // waterline
+  if (surf > -20 && surf < VH + 20){
+    ctx.strokeStyle = 'rgba(255,255,255,0.55)'; ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    for (let x = L - 20; x <= VW/2 + 20; x += 8){
+      const y = waveAt(x, S.tr) - S.cam;
+      x === L - 20 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+
+  if (S.fade > 0.001){
+    ctx.globalAlpha = S.fade; ctx.fillStyle = '#03161f';
+    ctx.fillRect(L, 0, VW, VH); ctx.globalAlpha = 1;
+  }
+}
+
+// dev hook: #seek=6 renders a single still frame 6s into the sequence (headless screenshots)
+const seek = parseFloat((location.hash.match(/seek=([\d.]+)/) || [])[1]);
+if (seek > 0) for (let i = 0; i < seek*60; i++) step(1/60);
+
+let last = 0;
+function frame(now){
+  const dtr = last ? Math.min(0.05, (now - last)/1000) : 0.016;
+  last = now;
+  if (!seek) step(dtr);      // frozen when seeking, so screenshots are deterministic
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+addEventListener('click', reset);
+addEventListener('keydown', e => { if (e.key === 'r' || e.key === ' ') reset(); });
+</script>
+<script>
+/* anonymous visit beacon — counts loads + presence heartbeats, no cookies */
+(function(){
+  if (location.protocol === "file:" || location.hostname === "localhost") return;
+  var EP = "https://site-analytics.vaibhavpro9210.workers.dev/ping";
+  var sid = sessionStorage.getItem("va_sid");
+  if (!sid) { sid = Math.random().toString(36).slice(2) + Date.now().toString(36); sessionStorage.setItem("va_sid", sid); }
+  function send(kind){
+    try { navigator.sendBeacon(EP, new Blob([JSON.stringify({sid:sid, page:location.pathname, kind:kind})], {type:"text/plain"})); } catch(e){}
+  }
+  send("load");
+  setInterval(function(){ if (document.visibilityState === "visible") send("beat"); }, 60000);
+})();
+</script>
+</body>
+</html>
