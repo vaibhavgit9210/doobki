@@ -1,0 +1,1199 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>doobki — the game</title>
+<style>
+  html,body{margin:0;height:100%;background:#04060a;overflow:hidden;touch-action:none}
+  body{display:grid;place-items:center;font:11px ui-monospace,monospace;color:#3a4a5c}
+  canvas{image-rendering:pixelated;image-rendering:crisp-edges;display:block}
+  #hud{position:fixed;top:10px;left:0;right:0;text-align:center;
+       font:12px ui-monospace,monospace;letter-spacing:.2em;text-transform:uppercase;
+       color:#dceaf5;text-shadow:0 1px 0 #04060a;pointer-events:none}
+  #hud b{color:#ffc94d;font-weight:400}
+  #panel{position:fixed;inset:0;display:grid;place-items:center;pointer-events:none}
+  #panel[hidden],#hud[hidden]{display:none}
+  #panel .box{background:rgba(5,9,15,.78);border:1px solid #24384e;border-radius:4px;
+       padding:24px 32px;text-align:center;font:12px/2 ui-monospace,monospace;
+       letter-spacing:.18em;text-transform:uppercase;color:#b9cde0;max-width:86vw}
+  #panel h1{margin:0 0 8px;font:600 34px ui-monospace,monospace;letter-spacing:.34em;
+       text-indent:.34em;color:#5ec8ff}
+  #panel .big{font-size:20px}
+  #panel .gold{color:#ffc94d}
+  #panel .dim{color:#5b6c80;font-size:10px}
+  #panel .go{color:#ffb35e;margin-top:10px}
+  #panel p{margin:2px 0}
+  #hint{position:fixed;bottom:8px;left:0;right:0;text-align:center;letter-spacing:.12em;
+        opacity:.55;pointer-events:none;text-transform:uppercase}
+</style>
+<canvas id="v"></canvas>
+<div id="hud" hidden></div>
+<div id="panel" hidden><div class="box" id="box"></div></div>
+<div id="hint"></div>
+<script>
+/* The game the doobki render tests were auditioning for. Built on the third-person
+   renderer: raycast sea plane, one shared projection, 384x288 dithered buffer, the
+   same sprite rig — plus rings to thread, birds and balloons to dodge, and a score.
+   Steering only ever touches vx: vertical speed and forward drift stay on the nominal
+   path, so every gate laid on that path is guaranteed to line up in depth when he
+   crosses its height. Left/right is the whole skill. */
+const W = 384, H = 288;                        // internal pixel resolution
+const F = (H / 2) / Math.tan(0.51);            // focal length, ~58 deg vertical fov
+const view = document.getElementById('v'), vc = view.getContext('2d');
+const off = document.createElement('canvas'); off.width = W; off.height = H;
+const oc = off.getContext('2d');
+const img = oc.createImageData(W, H), D = img.data;
+for (let i = 3; i < D.length; i += 4) D[i] = 255;
+const hud = document.getElementById('hud'), panel = document.getElementById('panel'),
+      box = document.getElementById('box'), hint = document.getElementById('hint');
+
+function resize(){
+  const s = Math.max(1, Math.min((innerWidth / W) | 0, ((innerHeight - 26) / H) | 0));
+  view.width = W * s; view.height = H * s;
+  vc.imageSmoothingEnabled = false;
+}
+addEventListener('resize', resize); resize();
+
+/* ---------- pixel plotting ---------- */
+function px(x, y, c){
+  x |= 0; y |= 0; if (x < 0 || y < 0 || x >= W || y >= H) return;
+  const i = (y * W + x) << 2;
+  D[i] = c >> 16 & 255; D[i+1] = c >> 8 & 255; D[i+2] = c & 255;
+}
+function pxa(x, y, c, a){
+  if (a <= 0) return; if (a >= 1) return px(x, y, c);
+  x |= 0; y |= 0; if (x < 0 || y < 0 || x >= W || y >= H) return;
+  const i = (y * W + x) << 2;
+  D[i]   += ((c >> 16 & 255) - D[i])   * a;
+  D[i+1] += ((c >>  8 & 255) - D[i+1]) * a;
+  D[i+2] += ((c       & 255) - D[i+2]) * a;
+}
+function pxAdd(x, y, c, a){
+  if (a <= 0) return;
+  x |= 0; y |= 0; if (x < 0 || y < 0 || x >= W || y >= H) return;
+  const i = (y * W + x) << 2;
+  D[i]   = Math.min(255, D[i]   + (c >> 16 & 255) * a);
+  D[i+1] = Math.min(255, D[i+1] + (c >>  8 & 255) * a);
+  D[i+2] = Math.min(255, D[i+2] + (c       & 255) * a);
+}
+function line(x0, y0, x1, y1, c, a){
+  const n = Math.max(1, Math.ceil(Math.max(Math.abs(x1-x0), Math.abs(y1-y0))));
+  for (let i = 0; i <= n; i++) pxa(x0 + (x1-x0)*i/n, y0 + (y1-y0)*i/n, c, a);
+}
+/* ordered dither — gives the gradients their chunky banded look */
+const BAY = [0,8,2,10, 12,4,14,6, 3,11,1,9, 15,7,13,5];
+const bay = (x, y) => BAY[((y & 3) << 2) | (x & 3)] / 16;
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const smooth = v => (v = clamp(v, 0, 1), v * v * (3 - 2 * v));
+/* foam thresholds against a hash of its WORLD position, not the screen Bayer grid,
+   so the speckle is irregular and travels with the wave that made it */
+function hashWorld(a, b){
+  let h = Math.imul(a | 0, 0x27d4eb2d) ^ Math.imul(b | 0, 0x165667b1);
+  h ^= h >>> 15; h = Math.imul(h, 0x2545f491); h ^= h >>> 13;
+  return (h >>> 0) / 4294967296;
+}
+
+/* ---------- palettes ---------- */
+const HAZE = [0xd3e6f1, 0xe8f2f8];             // horizon band
+const SHAZE = 0xa8cee3;                        // what the sea fades into at distance
+const ZEN  = 0x1b4f9c;                         // zenith
+const MID  = 0x4e93d4;
+const SEA_NEAR = [0x0a3a5a, 0x3aa8c4];         // trough / crest, close to camera
+const SEA_FAR  = [0x2a6f96, 0x63b3cd];
+const DEEP = 0x01080f;
+const FOAM = [0xffffff, 0xe2f6ff, 0xaddff2];
+const GOLD = 0xffc94d;
+const UWTR = [                                 // underwater body, keyed on depth
+  { t:   0, c: 0x2f93ae }, { t: 120, c: 0x1d6d90 }, { t: 260, c: 0x11486c },
+  { t: 430, c: 0x0a2f52 }, { t: 620, c: 0x05192f }, { t: 820, c: 0x010810 },
+];
+function lerpStops(stops, t){
+  if (t <= stops[0].t) return stops[0].c;
+  for (let i = 1; i < stops.length; i++) if (t <= stops[i].t){
+    const a = stops[i-1], b = stops[i], f = (t - a.t) / (b.t - a.t);
+    return mix(a.c, b.c, f);
+  }
+  return stops[stops.length-1].c;
+}
+function mix(c, target, f){
+  const r = (c>>16&255) + ((target>>16&255) - (c>>16&255)) * f;
+  const g = (c>>8&255)  + ((target>>8&255)  - (c>>8&255))  * f;
+  const b = (c&255)     + ((target&255)     - (c&255))     * f;
+  return ((r|0) << 16) | ((g|0) << 8) | (b|0);
+}
+
+/* ---------- rng (seeded, so #seed= gives a reproducible layout) ---------- */
+function mulberry(s){ return () => { s |= 0; s = s + 0x6D2B79F5 | 0;
+  let t = Math.imul(s ^ s >>> 15, 1 | s); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+  return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+/* ---------- sprites, all seen from behind ---------- */
+const PAL = {
+  h: 0x2f2217, H: 0x4b3826,                    // hair
+  s: 0xe8b088, S: 0xc08159,                    // skin
+  t: 0xc9484a, T: 0xe4655f, u: 0x8f2f36,       // shirt
+  p: 0x2d3a58, P: 0x41547a, q: 0x1d2740,       // trousers
+  b: 0x181310,                                 // boots
+};
+const sprite = rows => ({ w: rows[0].length, h: rows.length, rows });
+const POSE = {
+  // spread — 69x48
+  spread: sprite([
+    '................................HHHHH................................',
+    '..............................HHhhhhhHH..............................',
+    '.............................HhhhhhhhHHH.............................',
+    '............................HhhhhhhhhhHHH............................',
+    '............................hhhhhhhhhhHHH............................',
+    '............................hhhhhhhhhhHHH............................',
+    '............................hhhhhhhhhhHHH............................',
+    '............................hhhhhhhhhhHHh............................',
+    '.............................hhhhhhhhHHh.............................',
+    '..............................hhhhhhhHh..............................',
+    '........................T......shhhhHs......T........................',
+    '.....................TTTtT.....SSsssss.....TuTTT.....................',
+    '...................TTuutttTTTTTTTsssuuTTTTTttttTTT...................',
+    '.................TTuuuuuuuttttttttttttttttttTTTTTTTT.................',
+    '...............TTuuuuuuuuttttttttttttttttttttTTTTTTTTT...............',
+    '............TTTuuuuuuuuutttttttttttttttttttttttTTTTTTTTTT............',
+    '..........TTuuuuuuuuuuutttttttttttttttttttttttttTTTTTTTTTTT..........',
+    '.........sssuuuuuuuuuuuutttttttttttttttttttttttTTTTTTTTTTsss.........',
+    '........ssssuuuuuuuuuuuutttttttttttttttttttttttTTTTTTTTTTSsss........',
+    '.......sSssssuuuuuuuuuuutttttttttttttttttttttuuTTTTTTTTTSSssss.......',
+    '.....ssssssssuuuttuuuu..uuuuuuttttttttttTTTTT..uuuutttTTSSssssss.....',
+    '....sSSsssssssuuuu......uuuuuuttttttttttTTTTT......uuuuSSSsssssss....',
+    '..ssSsssssSSuu..........uuuuuuttttttttttTTTTu..........uuSSSsssssss..',
+    '.sSSsssssS...............uuuuuttttttttttTTTT...............SSSssssss.',
+    'sSSssssSS................uuuuuttttttttttTTTT................SSSssssss',
+    'SSsssSS..................uuuuuttttttttttTTTT..................SSsssss',
+    'SSssS....................uuuuuttttttttttTTTT....................SSssS',
+    '.SSS.....................qqqqqppppppppppPPPP.....................SSS.',
+    '........................PqqqqqppppppppppPPPPP........................',
+    '.......................PqqqqqppppppppppppPPPPP.......................',
+    '.......................qqqqqqppppppppppppPPPPP.......................',
+    '......................PqqqqqqpppqqqqqppppPPPPPP......................',
+    '.....................PqqpppppPPq.....qqqpppppPPP.....................',
+    '.....................qqqpppppPq.......qqqpppppPP.....................',
+    '....................PqqpppppPq.........qqqpppppPP....................',
+    '...................PqqpppppPq...........qqqpppppPP...................',
+    '...................qqqppppPq.............qqqppppPP...................',
+    '...................qqppppPq...............qqppppPP...................',
+    '..................PqppppPq.................qqppppPP..................',
+    '..................qqpppPq...................qqpppPP..................',
+    '.................PqpppPq.....................qqpppPP.................',
+    '................PqpppPq.......................qqpppPP................',
+    '................qqppPP.........................qqppPP................',
+    '...............bbbqppq.........................qppPbbb...............',
+    '.............bbbbbbbq...........................qbbbbbbb.............',
+    '.............bbbbbbb.............................bbbbbbb.............',
+    '.............bbbbbbb.............................bbbbbbb.............',
+    '...............bbb.................................bbb...............',
+  ]),
+  // spreadB — 69x48
+  spreadB: sprite([
+    '................................HHHHH................................',
+    '..............................HHhhhhhHH..............................',
+    '.............................HhhhhhhhHHH.............................',
+    '............................HhhhhhhhhhHHH............................',
+    '............................hhhhhhhhhhHHH............................',
+    '............................hhhhhhhhhhHHH............................',
+    '............................hhhhhhhhhhHHH............................',
+    '............................hhhhhhhhhhHHh............................',
+    '.............................hhhhhhhhHHh.............................',
+    '..............................hhhhhhhHh..............................',
+    '........................T......shhhhHs......T........................',
+    '......................TTt......SSsssss......tTT......................',
+    '....................TTuutTTTTTTTTsssuuTTTTTTttTTT....................',
+    '...................TuuuuuuuttttttttttttttttTTTTTTT...................',
+    '.................TTuuuuuuuttttttttttttttttttTTTTTTTT.................',
+    '...............TTuuuuuuuuttttttttttttttttttttTTTTTTTTT...............',
+    '.............TTuuuuuuuuuttttttttttttttttttttttTTTTTTTTTT.............',
+    '............TuuuuuuuuuuutttttttttttttttttttttttTTTTTTTTTT............',
+    '..........TTuuuuuuuuuuutttttttttttttttttttttttttTTTTTTTTTTT..........',
+    '.........sssuuuuuuuuuuuutttttttttttttttttttttttTTTTTTTTTTsss.........',
+    '........ssssuuuuuuuuuuuutttttttttttttttttttttuuuTTTTTTTTTSsss........',
+    '.......sSssssuuttttuu...uuuuuuttttttttttTTTTT...uuttttTTSSssss.......',
+    '.....ssssssssuutuuu.....uuuuuuttttttttttTTTTu.....uuutTTSSssssss.....',
+    '....sSSsssssSSuu.........uuuuuttttttttttTTTT.........uuSSSsssssss....',
+    '..ssSsssssSS.............uuuuuttttttttttTTTT.............SSSsssssss..',
+    '.sSSsssssS...............uuuuuttttttttttTTTT...............SSSssssss.',
+    'sSSssssSS................uuuuuttttttttttTTTT................SSSssssss',
+    'SSsssSS..................qqqqqppppppppppPPPP..................SSsssss',
+    'SSssS...................PqqqqqppppppppppPPPPP...................SSssS',
+    '.SSS...................PqqqqqppppppppppppPPPPP...................SSS.',
+    '......................PqqqqqqppppppppppppPPPPPP......................',
+    '......................qqqqqqqpppqqqqqppppPPPPPP......................',
+    '.....................PqqpppppPPq.....qqqpppppPPP.....................',
+    '....................PqqpppppPPq.......qqqpppppPPP....................',
+    '....................qqqpppppPq.........qqqpppppPP....................',
+    '...................PqqpppppPq...........qqqpppppPP...................',
+    '..................PqqpppppPq.............qqqpppppPP..................',
+    '.................PqqpppppPq...............qqqpppppPP.................',
+    '.................qqqppppPq.................qqqppppPP.................',
+    '................PqqppppPq...................qqqppppPP................',
+    '................qqppppPq.....................qqppppPP................',
+    '...............PqppppPq.......................qqppppPP...............',
+    '..............PqppppPq.........................qqppppPP..............',
+    '.............bbbqqpqq...........................qqppPbbb.............',
+    '...........bbbbbbbq...............................qbbbbbbb...........',
+    '...........bbbbbbb.................................bbbbbbb...........',
+    '...........bbbbbbb.................................bbbbbbb...........',
+    '.............bbb.....................................bbb.............',
+  ]),
+  // tuck — 29x51
+  tuck: sprite([
+    '.............HHH.............',
+    '...........HHhhhHH...........',
+    '.........HHhhhhhhHHH.........',
+    '.........hhhhhhhhHHH.........',
+    '........HhhhhhhhhhHHH........',
+    '........hhhhhhhhhhHHH........',
+    '........hhhhhhhhhhHHh........',
+    '.........hhhhhhhhHHH.........',
+    '.........hhhhhhhhHhh.........',
+    '...........hhhhhHH...........',
+    '...........sshhhss...........',
+    '...........SSsssss...........',
+    '....TTTTTTTTTsssuuTTTTTTT....',
+    '....uuuuuuttttttttttTTTTT....',
+    '...tuuuuuuttttttttttTTTTTt...',
+    '...uuutuuuutttttttTTTTuuut...',
+    '...uuuuuttuuuttttTTuuuuutt...',
+    '...uuuuuttuuuttttTTuuuuutt...',
+    '..tuuuuuttuuuttttTTuuuuuutt..',
+    '..uuuuuttuuutttttTTTuuuuutt..',
+    '..uuuuuttuuutttttTTTuuuuutt..',
+    '..uuuuuttuuutttttTTTuuuuutt..',
+    '.tuuuuttuuuuttttttTTTuuuuutt.',
+    '.uuuuuttuuuuttttttTTTuuuuutt.',
+    '.uuuuttuuuutttttttTTTTuuuutt.',
+    '.uuuuttuuuutttttttTTTTuuuutt.',
+    'sssuuuuuuuutttttttTTTTuuutsss',
+    'SSsssS.qqqqpppppppPPPP.SSssss',
+    'SSsss..qqqqpppppppPPPP..SSsss',
+    'SSsssPPqqqppppppppppPPPPSSsss',
+    'SSsssqqqqqppppppppppPPPPSSsss',
+    'SSssSqqqqqpppqqqppppPPPPSSsss',
+    'SSss.qqppppPP...qqppppPP.SsSS',
+    '..SS.qqppppPP...qqppppPP.SS..',
+    '.....qqppppPP...qqppppPP.....',
+    '.....qqppppPq...qqppppPP.....',
+    '.....qqpppPP.....qqpppPP.....',
+    '.....qqpppPP.....qqpppPP.....',
+    '.....qqpppPP.....qqpppPP.....',
+    '.....qqpppPP.....qqpppPq.....',
+    '......qqppPq.....qqppPP......',
+    '.....PqppPP.......qqppPP.....',
+    '.....qqppPP.......qqppPP.....',
+    '.....qqppPP.......qqppPP.....',
+    '.....qqppPq.......qqppPP.....',
+    '.....qqppP.........qqppP.....',
+    '.....ppbpp.........ppbpp.....',
+    '.....bbbbb.........bbbbb.....',
+    '....bbbbbbb.......bbbbbbb....',
+    '.....bbbbb.........bbbbb.....',
+    '.......b.............b.......',
+  ]),
+  // plunge — 21x41
+  plunge: sprite([
+    '........HHHHH........',
+    '......HHhhhhhHH......',
+    '.....HhhhhhhhHHH.....',
+    '.....hhhhhhhhHHH.....',
+    '.....hhhhhhhhHHH.....',
+    '.....hhhhhhhhHHH.....',
+    '.....hhhhhhhhHHh.....',
+    '......hhhhhhhhh......',
+    '........hhhhH........',
+    '.......sSsssss.......',
+    '........SSsss........',
+    '..TTTTTTTTsuuTTTTTT..',
+    '..uuuuuttttttttTTTT..',
+    '..uuuuuutttttTTTuuu..',
+    '.tuuuuttuuttTuuuuutt.',
+    '.uuuuuttuuttTuuuuutt.',
+    '.uuuuttuutttTTuuuutt.',
+    '.uuuuttuutttTTuuuutt.',
+    'tuuuttuuuttttTTuuuutt',
+    'uuuuttuuuttttTTuuuutt',
+    'uuuutuuutttttTTTuuuuu',
+    '..uuuuuutttttTTTuuu..',
+    '....uuuuttttttTTT....',
+    '...PqqqpppppppPPPP...',
+    '...qqqqpppppppPPPP...',
+    '...qqqqpppppppPPPP...',
+    '...qqqqpppqpppPPPP...',
+    '...qqpppPP.qqpppPP...',
+    '...qqpppPP.qqpppPP...',
+    '...qqpppPP.qqpppPP...',
+    '...qqpppPP.qqpppPP...',
+    '...qqpppPq.qqpppPP...',
+    '...qqppPP...qqppPP...',
+    '...qqppPP...qqppPP...',
+    '...qqppPP...qqppPP...',
+    '...qqppPP...qqppPP...',
+    '...qqppPP...qqppPP...',
+    '...qqppPP...qqppPq...',
+    '....bbbbp...pbbbb....',
+    '...bbbbbb...bbbbbb...',
+    '....bbbb.....bbbb....',
+  ]),
+  // sink — 45x42
+  sink: sprite([
+    '.....................HHH.....................',
+    '...................HHhhhHH...................',
+    '.................HHhhhhhhHHH.................',
+    '.................hhhhhhhhHHH.................',
+    '..sss...........HhhhhhhhhhHHH...........sss..',
+    '.sSssss.........hhhhhhhhhhHHH.........ssssss.',
+    'sSSssssss.......hhhhhhhhhhHHh.......ssSssssss',
+    '.SSssssssTTT.....hhhhhhhhHHH.....TTTSSsssssS.',
+    '..SSssssuuttTT...hhhhhhhhHhh...TTttTTSSsssS..',
+    '...SSssuuuttttTTT..hhhhhHH..TTTtttttTTSsSS...',
+    '.....SsuuutttttTT..sshhhss..uuutttttTTsS.....',
+    '......uuutttttTTT..SSsssss..uuutttttTTu......',
+    '.......uuuuttttttTTTTsssuuTTtttttttTTu.......',
+    '........uuuuuuuuttttttttttttttTTTTTuu........',
+    '..........uuuuuuuttttttttttttTTTTTu..........',
+    '...........uuuuuuttttttttttttTTTuu...........',
+    '.............uuuuuttttttttttTTTT.............',
+    '.............uuuuuttttttttttTTTT.............',
+    '.............uuuuuttttttttttTTTT.............',
+    '.............uuuuuttttttttttTTTT.............',
+    '.............uuuuuttttttttttTTTu.............',
+    '..............uuuuuttttttttTTTT..............',
+    '..............uuuuuttttttttTTTT..............',
+    '..............uuuuuttttttttTTTT..............',
+    '..............uuuuuttttttttTTTT..............',
+    '..............uuuuuttttttttTTTT..............',
+    '..............qqqqqppppppppPPPP..............',
+    '.............PqqqqppppppppppPPPP.............',
+    '.............qqqqqppppppppppPPPP.............',
+    '.............qqqqqppppppppppPPPP.............',
+    '.............qqqqqpppqqqqpppPPPP.............',
+    '.............qqppppPq....qqpppPP.............',
+    '.............qqpppPP.....qqpppPP.............',
+    '.............qqpppPP.....qqppppPP............',
+    '.............qqpppPP......qqpppPP............',
+    '.............qqpppPq......qqpppPP............',
+    '.............qqppPP.......qqpppPP............',
+    '.............qqppPP........qqppPP............',
+    '.............qqppPP........qqppPP............',
+    '.............bbbbbq........qbbbbb............',
+    '.............bbbbb..........bbbbb............',
+    '.............bbbbb..........bbbbb............',
+  ]),
+};
+/* nearest-neighbour rotate + scale straight into the pixel buffer — stays chunky */
+function drawSprite(sp, cx, cy, ang, scale, fade, tint){
+  const inv = 1 / scale, c = Math.cos(-ang), s = Math.sin(-ang);
+  const R = Math.ceil(Math.hypot(sp.w, sp.h) * scale / 2) + 1;
+  const hx = (sp.w - 1) / 2, hy = (sp.h - 1) / 2;
+  for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++){
+    const ux = dx * inv, uy = dy * inv;
+    const sx = Math.round(ux * c - uy * s + hx), sy = Math.round(ux * s + uy * c + hy);
+    if (sx < 0 || sy < 0 || sx >= sp.w || sy >= sp.h) continue;
+    const ch = sp.rows[sy][sx];
+    if (ch === '.') continue;
+    px(cx + dx, cy + dy, fade > 0 ? mix(PAL[ch], tint === undefined ? DEEP : tint, fade) : PAL[ch]);
+  }
+}
+
+/* ---------- camera ---------- */
+/* world: x right, y up (0 = water surface), z forward along the dive */
+const cam = { x: 0, y: 0, z: 0, pit: 0.34 };
+let cp = 1, sp_ = 0;                                   // cos/sin of pitch, per frame
+function project(wx, wy, wz){
+  const ex = wx - cam.x, ey = wy - cam.y, ez = wz - cam.z;
+  const depth = -ey * sp_ + ez * cp;                   // along the view axis
+  const upc  =  ey * cp  + ez * sp_;
+  return { x: W/2 + F * ex / depth, y: H/2 - F * upc / depth, depth };
+}
+function projectDir(dx, dy, dz){
+  const depth = -dy * sp_ + dz * cp;
+  return { x: W/2 + F * dx / depth, y: H/2 - F * (dy * cp + dz * sp_) / depth, depth };
+}
+const SUN = (() => { const az = 0.52, el = 0.115;      // low, so it lays a glitter road
+  return { x: Math.sin(az)*Math.cos(el), y: Math.sin(el), z: Math.cos(az)*Math.cos(el) }; })();
+
+/* ---------- scene / game state ---------- */
+const START_H = 6000, G = 300, VMAX = 560;
+const DRIFT = 200;                                     // forward speed — never changes,
+const AX = 780, VXMAX = 250;                           // so gates always line up in z
+const BACK = 18, FRAME_Y = 166;                        // trail distance, entry framing row
+const SPRITE_K = 0.0888;
+/* The gameplay camera has to look much steeper than the render test's: at terminal
+   velocity the dive path runs ~70 deg below horizontal, and at the cinematic pitch
+   nothing on that path is inside the frustum at all. So during play the pitch opens
+   to ~0.95 rad — sea fills the frame, the rings ahead stack up like a tube — and it
+   eases back to the render test's horizon framing for the last 700 units, so the
+   entry splash is the same shot the look-dev was built around. */
+const PLAY_PIT = 0.95, PLAY_FY = 112;
+let man, t, rt, mode, impactT, impactRT, shake, flash, wentUnder;
+let clouds, specks, snow, bubbles, drops, rings, patch;
+let gates, sparks, camXOff, prevY, stun;
+let score, combo, hits, ringsGot, bonus, newBest, resShown;
+let best = +localStorage.getItem('doobki-best') || 0;
+
+/* nominal path: closed-form z at a given height. Steering never touches vy or vz,
+   so this is exact (up to integrator error of a unit or two) for the live fall too. */
+const T1 = (VMAX - 30) / G, D1 = 30 * T1 + G / 2 * T1 * T1;
+function zAt(y){
+  const d = START_H - y;
+  const tt = d < D1 ? (-30 + Math.sqrt(900 + 2 * G * d)) / G : T1 + (d - D1) / VMAX;
+  return DRIFT * tt;
+}
+
+function reset(seed){
+  const R = mulberry(seed);
+  man = { x: 0, y: START_H, z: 0, vy: 30, vx: 0, vz: DRIFT, ang: 0, spin: 0, pose: 'spread' };
+  cam.x = 0; cam.y = START_H + 22; cam.z = -BACK; cam.pit = 0.34; camXOff = 0;
+  t = 0; rt = 0; mode = 'fall'; impactT = 0; impactRT = 0;
+  shake = 0; flash = 0; wentUnder = false; stun = 0; prevY = START_H;
+  score = 0; combo = 1; hits = 0; ringsGot = 0; bonus = 0; newBest = false; resShown = false;
+  bubbles = []; drops = []; rings = []; sparks = []; patch = null;
+
+  /* the course: one gate every ~300 units of height, laid on the nominal path.
+     The ring line wanders as a random walk, rings shrink and hazards thicken lower down. */
+  gates = [];
+  let cx = 0, gy = START_H - 700;
+  while (gy > 620){
+    const p = 1 - gy / START_H;
+    cx = clamp(cx + (R() - 0.5) * 170, -120, 120);
+    const k = R();
+    if (k < 0.62)
+      gates.push({ kind: 'ring', x: cx, y: gy, z: zAt(gy), r: 15 - 5.5 * p, pop: 0, done: false });
+    else if (k < 0.83)
+      gates.push({ kind: 'bird', x: cx + (R() - 0.5) * 120, y: gy, z: zAt(gy), r: 4,
+                   vx: (R() < 0.5 ? -1 : 1) * (26 + R() * 60), ph: R() * 6.3, done: false });
+    else
+      gates.push({ kind: 'bal', x: cx + (R() - 0.5) * 100, y: gy, z: zAt(gy), r: 5.5,
+                   ph: R() * 6.3, done: false });
+    if (R() < p * 0.55){                               // difficulty: a second hazard in the band
+      const oy = gy - 90 - R() * 60;
+      if (oy > 600){
+        const bird = R() < 0.5;
+        gates.push({ kind: bird ? 'bird' : 'bal', x: cx + (R() - 0.5) * 160, y: oy, z: zAt(oy),
+                     r: bird ? 4 : 5.5, vx: (R() < 0.5 ? -1 : 1) * (26 + R() * 60),
+                     ph: R() * 6.3, done: false });
+      }
+    }
+    gy -= 250 + R() * 90;
+  }
+
+  clouds = [];
+  for (let i = 0; i < 38; i++){
+    const blobs = [], n = 6 + (R() * 5 | 0), r0 = 24 + R() * 34;
+    for (let j = 0; j < n; j++)
+      blobs.push({ ox: (j - n / 2) * r0 * 0.62 + (R() - 0.5) * r0 * 0.4,
+                   oz: (R() - 0.5) * r0 * 1.1, oy: (R() - 0.5) * r0 * 0.3,
+                   r: r0 * (0.45 + R() * 0.55) });
+    // anchored to the path in z, because the dive covers 2300 units of forward drift
+    const y = 420 + R() * 5200;
+    clouds.push({ x: (R() - 0.5) * 1000, y, z: zAt(y) + (R() - 0.5) * 800, blobs });
+  }
+  specks = [];                                          // rushing air, world space near the camera
+  for (let i = 0; i < 175; i++)
+    specks.push({ x: (R() - 0.5) * 130, y: (R() - 0.5) * 150, z: (R() - 0.5) * 130 });
+  snow = [];                                            // marine snow, spawned lazily underwater
+  for (let i = 0; i < 205; i++)
+    snow.push({ x: (R() - 0.5) * 90, y: -R() * 500, z: (R() - 0.5) * 90, r: R() < 0.2 ? 1 : 0, ph: R() * 6.3 });
+}
+
+/* ---------- the water height field (see third-person/README.md) ---------- */
+const WAVE = [                     // wx coeff, wz coeff, time coeff, amplitude
+  [0.013, -0.006, 0.3, 0.55],      // broad mottle — never fades, breaks up the tiling
+  [0.031,  0.052, 0.9, 1.00],      // the main swell
+  [0.017, -0.073, 0.6, 0.80],
+  [0.083, -0.041, -1.3, 0.62],
+  [0.210,  0.170, 2.6, 0.38],      // chop
+  [0.440, -0.380, 3.7, 0.22],      // ripple
+  [1.350, -1.050, 5.2, 0.20],      // fine texture: only resolves in the last few metres
+];
+const LOD = [0.011, 0.05, 0.11, 0.20, 0.34, 0.70, 1.09];
+const WNORM = 1 / 2.4;
+const WAMP = new Float64Array(7), WS = new Float64Array(7), WC = new Float64Array(7);
+const WSB = new Float64Array(7), WCB = new Float64Array(7);
+
+/* ---------- input ---------- */
+const keys = { L: false, R: false };
+let ptrX = null;
+function readSteer(){
+  let s = (keys.R ? 1 : 0) - (keys.L ? 1 : 0);
+  if (!s && ptrX !== null) s = ptrX < innerWidth / 2 ? -1 : 1;
+  return s;
+}
+function tryStart(){
+  if (mode === 'title'){ mode = 'fall'; man.y = START_H; panel.hidden = true; hud.hidden = false; }
+  else if (mode === 'water' && rt - impactRT > 1.35) startRun();
+}
+function startRun(){
+  reset((Math.random() * 1e9) | 0);
+  mode = 'fall'; panel.hidden = true; hud.hidden = false;
+}
+addEventListener('keydown', e => {
+  if (e.code === 'Space') e.preventDefault();
+  if (e.repeat) return;
+  audio();
+  if (e.code === 'ArrowLeft'  || e.code === 'KeyA') keys.L = true;
+  if (e.code === 'ArrowRight' || e.code === 'KeyD') keys.R = true;
+  if (e.code === 'KeyR' && mode !== 'title'){ startRun(); return; }
+  if (mode !== 'fall' && /Space|Enter|ArrowLeft|ArrowRight|KeyA|KeyD/.test(e.code)) tryStart();
+});
+addEventListener('keyup', e => {
+  if (e.code === 'ArrowLeft'  || e.code === 'KeyA') keys.L = false;
+  if (e.code === 'ArrowRight' || e.code === 'KeyD') keys.R = false;
+});
+addEventListener('pointerdown', e => { audio(); ptrX = e.clientX; if (mode !== 'fall') tryStart(); });
+addEventListener('pointermove', e => { if (ptrX !== null) ptrX = e.clientX; });
+addEventListener('pointerup',     () => ptrX = null);
+addEventListener('pointercancel', () => ptrX = null);
+
+/* ---------- sound (synthesized, created on the first gesture) ---------- */
+let AC = null, windGain = null, windLP = null, noiseBuf = null;
+function audio(){
+  if (AC){ if (AC.state === 'suspended') AC.resume(); return; }
+  try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e){ return; }
+  noiseBuf = AC.createBuffer(1, AC.sampleRate, AC.sampleRate);
+  const d = noiseBuf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  const src = AC.createBufferSource(); src.buffer = noiseBuf; src.loop = true;
+  windLP = AC.createBiquadFilter(); windLP.type = 'lowpass'; windLP.frequency.value = 300;
+  windGain = AC.createGain(); windGain.gain.value = 0;
+  src.connect(windLP); windLP.connect(windGain); windGain.connect(AC.destination);
+  src.start();
+}
+function env(node, v, dur){
+  const g = AC.createGain();
+  g.gain.setValueAtTime(v, AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + dur);
+  node.connect(g); g.connect(AC.destination);
+}
+function tone(f, dur, vol, type, when){
+  if (!AC) return;
+  const o = AC.createOscillator(); o.type = type || 'triangle'; o.frequency.value = f;
+  env(o, vol, dur); o.start(AC.currentTime + (when || 0)); o.stop(AC.currentTime + (when || 0) + dur);
+}
+function noiseHit(dur, freq, vol, type){
+  if (!AC) return;
+  const s = AC.createBufferSource(); s.buffer = noiseBuf;
+  const f = AC.createBiquadFilter(); f.type = type || 'lowpass'; f.frequency.value = freq;
+  s.connect(f); env(f, vol, dur); s.start(); s.stop(AC.currentTime + dur);
+}
+function sChime(n){                                    // ring: pitch climbs with the combo
+  const f = 520 * Math.pow(2, (Math.min(n, 8) - 1) * 2 / 12);
+  tone(f, 0.16, 0.14); tone(f * 1.5, 0.24, 0.09, 'triangle', 0.06);
+}
+function sThud(){
+  if (!AC) return;
+  const o = AC.createOscillator(); o.type = 'sawtooth';
+  o.frequency.setValueAtTime(140, AC.currentTime);
+  o.frequency.exponentialRampToValueAtTime(46, AC.currentTime + 0.18);
+  env(o, 0.2, 0.2); o.start(); o.stop(AC.currentTime + 0.2);
+  noiseHit(0.1, 500, 0.22);
+}
+function sSplash(){
+  if (!AC) return;
+  const s = AC.createBufferSource(); s.buffer = noiseBuf;
+  const f = AC.createBiquadFilter(); f.type = 'bandpass';
+  f.frequency.setValueAtTime(1400, AC.currentTime);
+  f.frequency.exponentialRampToValueAtTime(160, AC.currentTime + 1);
+  s.connect(f); env(f, 0.34, 1.1); s.start(); s.stop(AC.currentTime + 1.1);
+  tone(90, 0.5, 0.16, 'sine');
+}
+function windUpdate(rdt){
+  if (!AC) return;
+  const spd = mode === 'fall' ? man.vy / VMAX : 0;
+  const target = mode === 'fall' ? 0.03 + 0.11 * spd : mode === 'water' ? 0.012 : 0.02;
+  windGain.gain.value += (target - windGain.gain.value) * Math.min(1, 3 * rdt);
+  windLP.frequency.value = 260 + 1100 * spd;
+}
+
+/* ---------- scoring events ---------- */
+function burst(x, y, z, n, colors, spread, up){
+  for (let i = 0; i < n; i++){
+    const a = Math.random() * 6.283, sp = spread * (0.4 + Math.random());
+    sparks.push({ x, y, z, vx: Math.cos(a) * sp, vy: up * (0.5 + Math.random()),
+                  vz: Math.sin(a) * sp, life: 1, c: colors[i % colors.length] });
+  }
+}
+function threadRing(e){
+  ringsGot++; score += 100 * combo; combo = Math.min(8, combo + 1);
+  e.pop = 1; sChime(combo);
+  for (let i = 0; i < 26; i++){                        // sparks off the rim itself
+    const th = i / 26 * 6.283;
+    sparks.push({ x: e.x + Math.cos(th) * e.r, y: e.y, z: e.z + Math.sin(th) * e.r,
+                  vx: Math.cos(th) * 22, vy: 26 + Math.random() * 40, vz: Math.sin(th) * 22,
+                  life: 1, c: i % 3 ? GOLD : 0xfff3c0 });
+  }
+}
+function hitObstacle(e){
+  hits++; combo = 1; stun = 0.5; shake = Math.max(shake, 2.6);
+  man.vx = (man.x < e.x ? -1 : 1) * 140;               // knocked away from it
+  sThud();
+  if (e.kind === 'bal') burst(e.x, e.y, e.z, 22, [0xd23c3c, 0xff8a70, 0x7e1f28], 30, 40);
+  else burst(e.x, e.y, e.z, 14, [0x2a3346, 0xcfd8e6], 24, 20);
+}
+
+/* ---------- update ---------- */
+function update(dt, rdt){
+  t += dt; rt += rdt;
+
+  if (mode === 'title'){
+    man.y = START_H + Math.sin(t * 0.8) * 6;           // hanging in the establishing shot
+    man.pose = (t * 2.5 | 0) % 2 ? 'spread' : 'spreadB';
+    man.ang = Math.sin(t * 1.5) * 0.12;
+  } else if (mode === 'fall'){
+    const steer = readSteer();
+    man.vy = Math.min(VMAX, man.vy + G * dt);
+    man.y -= man.vy * dt;
+    man.vx += steer * AX * dt;
+    if (!steer) man.vx *= Math.pow(0.08, dt);
+    if (stun > 0){ stun -= dt; man.vx *= Math.pow(0.3, dt); }
+    man.vx = clamp(man.vx, -VXMAX, VXMAX);
+    man.x = clamp(man.x + man.vx * dt, -420, 420);
+    man.z += man.vz * dt;
+
+    if (man.y > 420){
+      man.pose = (t * 3.2 | 0) % 2 ? 'spread' : 'spreadB';
+      const lean = clamp(man.vx * 0.0024, -0.55, 0.55) + Math.sin(t * 1.5) * 0.05
+                 + (stun > 0 ? Math.sin(t * 22) * 0.3 : 0);
+      man.ang += (lean - man.ang) * Math.min(1, 10 * dt);
+    } else {
+      man.pose = 'plunge';                              // straighten out for entry
+      man.ang += (clamp(man.vx * 0.0013, -0.3, 0.3) + Math.sin(t * 3) * 0.04 - man.ang) * Math.min(1, 6 * dt);
+    }
+
+    for (const e of gates){
+      if (e.done) continue;
+      if (e.kind === 'bird') e.x += e.vx * dt;
+      else if (e.kind === 'bal') e.y += 10 * dt;
+      if (e.kind === 'ring'){
+        if (prevY >= e.y && man.y < e.y){               // crossed the ring's plane this frame
+          e.done = true;
+          if (Math.hypot(man.x - e.x, man.z - e.z) < e.r) threadRing(e);
+          else combo = 1;                               // a miss breaks the chain too
+        }
+      } else if (Math.abs(man.y - e.y) < 12){
+        if (Math.hypot(man.x - e.x, man.z - e.z) < e.r + 3.4){ e.done = e.dead = true; hitObstacle(e); }
+      } else if (man.y < e.y - 12) e.done = true;
+    }
+    prevY = man.y;
+    if (man.y <= 0) impact();
+  } else {
+    // underwater: drag bleeds the entry speed off, then a slow settle
+    man.vy += (45 - man.vy) * Math.min(1, 1.5 * dt);
+    man.y -= man.vy * dt;
+    man.x += man.vx * dt; man.z += man.vz * dt;
+    man.vx *= Math.pow(0.25, dt); man.vz *= Math.pow(0.25, dt);
+    man.spin *= Math.pow(0.5, dt);
+    man.ang += man.spin * dt + Math.sin(t * 0.7) * 0.2 * dt;
+    man.pose = t - impactT < 0.45 ? 'plunge' : 'sink';
+    if (Math.random() < dt * 40 && man.y > -760)
+      bubbles.push({ x: man.x + (Math.random()-0.5)*7, y: man.y + (Math.random()-0.5)*8,
+                     z: man.z + (Math.random()-0.5)*7, r: 0.18 + Math.random()*0.42,
+                     vy: 26 + Math.random()*34, ph: Math.random()*6.3, a: 1 });
+    if (!resShown && rt - impactRT > 1.3){ resShown = true; showResults(); }
+  }
+
+  for (const e of gates) if (e.pop > 0) e.pop -= dt * 2.4;
+
+  /* Camera. Height and z are SOLVED, not chased — at 560 units/s a lagging follow
+     never catches up (see third-person/README.md). During play the pitch opens to
+     PLAY_PIT; over the last 700 units it eases back to the render test's entry
+     framing so the splash is the same shot. */
+  const near = smooth(1 - man.y / 950);
+  let pitT, fy, back = BACK;
+  if (mode === 'water'){
+    pitT = 0.28; fy = 205; back = BACK + 80 * smooth((t - impactT) / 3.4);
+  } else if (mode === 'title'){ pitT = 0.34; fy = FRAME_Y; }
+  else {
+    const u = smooth(clamp(1 - man.y / 700, 0, 1));
+    pitT = PLAY_PIT + (0.34 + 0.24 * near - PLAY_PIT) * u;
+    fy = PLAY_FY + (FRAME_Y - PLAY_FY) * u;
+  }
+  cam.pit += (pitT - cam.pit) * Math.min(1, 3.2 * rdt);
+  const up = back * Math.tan(cam.pit + Math.atan((fy - H/2) / F));
+  if (mode !== 'water'){
+    // a touch of look-ahead into the steer; x is otherwise locked, lag would lose him
+    camXOff += (clamp(man.vx * 0.012, -3.2, 3.2) - camXOff) * Math.min(1, 6 * rdt);
+    cam.x = man.x + camXOff;
+    cam.z = man.z - back;
+    cam.y = man.y + up;
+  } else {
+    const f = Math.min(1, 6 * rdt);
+    cam.x += (man.x - cam.x) * f;
+    cam.z += (man.z - back - cam.z) * f;
+    cam.y += (man.y + up - cam.y) * Math.min(1, 4 * rdt);
+    const upMax = back * Math.tan(cam.pit + Math.atan((H * 0.80 - H/2) / F));
+    if (cam.y > man.y + upMax) cam.y = man.y + upMax;    // never let him sink off frame
+  }
+  if (!wentUnder && cam.y < 0){ wentUnder = true; flash = 1; shake = 5; }
+
+  // wrap both fields around the camera. `while`, not `if`: the camera covers a lot
+  // of ground per frame at terminal velocity
+  for (const s of specks){
+    while (s.y - cam.y >  75) s.y -= 150; while (s.y - cam.y < -75) s.y += 150;
+    while (s.x - cam.x >  65) s.x -= 130; while (s.x - cam.x < -65) s.x += 130;
+    while (s.z - cam.z >  65) s.z -= 130; while (s.z - cam.z < -65) s.z += 130;
+  }
+  for (const s of snow){
+    s.y -= 4 * dt;
+    while (s.y - cam.y >  60) s.y -= 120; while (s.y - cam.y < -60) s.y += 120;
+    while (s.x - cam.x >  45) s.x -= 90;  while (s.x - cam.x < -45) s.x += 90;
+    while (s.z - cam.z >  45) s.z -= 90;  while (s.z - cam.z < -45) s.z += 90;
+  }
+  for (const b of bubbles){
+    b.y += b.vy * dt; b.vy *= Math.pow(0.86, dt); b.vy = Math.max(b.vy, 11);
+    b.x += Math.sin(t * 2.6 + b.ph) * 7 * dt;
+    if (b.y >= 0) b.a -= dt * 6;
+  }
+  bubbles = bubbles.filter(b => b.a > 0);
+  for (const d of drops){
+    d.vy -= 420 * dt; d.x += d.vx * dt; d.y += d.vy * dt; d.z += d.vz * dt; d.life -= dt;
+    if (d.y <= 0 && d.vy < 0) d.life = 0;
+  }
+  drops = drops.filter(d => d.life > 0);
+  for (const s of sparks){
+    s.vy -= 140 * dt; s.x += s.vx * dt; s.y += s.vy * dt; s.z += s.vz * dt; s.life -= dt * 1.7;
+  }
+  sparks = sparks.filter(s => s.life > 0);
+  for (const r of rings){ r.r += r.sp * dt; r.sp *= Math.pow(0.5, dt); r.life -= dt / r.dur; }
+  rings = rings.filter(r => r.life > 0);
+  if (patch){ patch.r += patch.sp * dt; patch.sp *= Math.pow(0.35, dt); patch.life -= dt / 1.6; }
+
+  shake *= Math.pow(0.02, rdt);
+  flash *= Math.pow(1e-6, rdt);                          // the foam curtain is brief
+}
+
+function impact(){
+  man.y = 0; mode = 'water'; impactT = t; impactRT = rt;
+  man.vy = VMAX * 0.9; man.spin = 0.45; shake = 3.5;
+  bonus = hits === 0 ? 500 : 0;                          // clean dive
+  score += bonus;
+  newBest = score > best;
+  if (newBest){ best = score; try { localStorage.setItem('doobki-best', best); } catch (e){} }
+  sSplash();
+  const ix = man.x, iz = man.z;
+  patch = { x: ix, z: iz, r: 2, sp: 16, life: 1 };
+  for (let i = 0; i < 3; i++)
+    rings.push({ x: ix, z: iz, r: 2 + i * 3, sp: 15 - i * 3, w: 1.2 + i * 0.4, life: 1 + i * 0.12, dur: 1.6 });
+  for (let i = 0; i < 240; i++){                        // the crown, thrown up and out
+    const a = Math.random() * 6.283, sp = 14 + Math.random() * 46;
+    const upv = 60 + Math.random() * 150;
+    drops.push({ x: ix + Math.cos(a) * 2, y: 1 + Math.random() * 2, z: iz + Math.sin(a) * 2,
+                 vx: Math.cos(a) * sp, vz: Math.sin(a) * sp, vy: upv,
+                 life: 2.4, big: Math.random() < 0.22 });
+  }
+  for (let i = 0; i < 145; i++)
+    bubbles.push({ x: ix + (Math.random()-0.5)*38, y: -2 - Math.random()*150, z: iz + (Math.random()-0.5)*38,
+                   r: 0.16 + Math.random()*0.5, vy: 30 + Math.random()*70, ph: Math.random()*6.3, a: 1 });
+}
+
+/* ---------- HUD / panels ---------- */
+function hudUpdate(){
+  if (hud.hidden) return;
+  hud.innerHTML = 'score ' + String(score).padStart(6, '0') +
+    (combo > 1 ? ' <b>×' + combo + '</b>' : '') +
+    ' &nbsp;·&nbsp; alt ' + Math.max(0, man.y | 0);
+}
+function showTitle(){
+  box.innerHTML = '<h1>doobki</h1>' +
+    '<p>fall · thread the rings · dodge birds &amp; balloons</p>' +
+    '<p class="dim">← → or A/D to steer &nbsp;·&nbsp; touch: hold a side of the screen</p>' +
+    (best ? '<p class="gold">best ' + best + '</p>' : '') +
+    '<p class="go">click or press space to dive</p>';
+  panel.hidden = false;
+}
+function showResults(){
+  box.innerHTML = '<h1>splash</h1>' +
+    '<p class="big gold">score ' + score + '</p>' +
+    '<p>rings ' + ringsGot + ' · hits ' + hits +
+      (bonus ? ' · <span class="gold">clean dive +500</span>' : '') + '</p>' +
+    '<p class="' + (newBest ? 'gold' : 'dim') + '">' + (newBest ? 'new best!' : 'best ' + best) + '</p>' +
+    '<p class="go">click or space — dive again</p>';
+  panel.hidden = false;
+}
+
+/* ---------- gate rendering ---------- */
+function drawGate(e){
+  const rr = e.r * (e.done ? 2 - e.pop : 1);            // popped rings swell as they fade
+  const col = e.done ? 0xfff3c0 : GOLD;
+  let prev = null;
+  for (let i = 0; i <= 60; i++){
+    const th = i / 60 * 6.28318;
+    const p = project(e.x + Math.cos(th) * rr, e.y, e.z + Math.sin(th) * rr);
+    if (p.depth < 5){ prev = null; continue; }
+    if (prev){
+      const row = clamp(p.y | 0, 0, H - 1);
+      if (p.depth < rowDepth[row]){
+        const c = mix(col, SHAZE, clamp(p.depth / 2400, 0, 0.5));
+        const a = e.done ? 0.9 * Math.max(0, e.pop) : clamp(1.3 - p.depth / 1900, 0.25, 0.95);
+        line(prev.x, prev.y, p.x, p.y, c, a);
+        if (F * rr / p.depth > 22) line(prev.x, prev.y - 1, p.x, p.y - 1, c, a * 0.7);
+      }
+    }
+    prev = p;
+  }
+}
+function drawBird(e){
+  const p = project(e.x, e.y, e.z);
+  if (p.depth < 5 || p.depth > 2600) return;
+  const row = clamp(p.y | 0, 0, H - 1);
+  if (p.depth > rowDepth[row]) return;
+  const s = F / p.depth, flap = Math.sin(rt * 10 + e.ph);
+  const w = Math.max(1.6, 3.4 * s), lift = flap * 1.4 * s;
+  const a = clamp(1.35 - p.depth / 1100, 0.3, 0.95);
+  line(p.x - w, p.y - lift, p.x, p.y, 0x1c2534, a);
+  line(p.x + w, p.y - lift, p.x, p.y, 0x1c2534, a);
+  pxa(p.x, p.y, 0x0f141d, a);
+  pxa(p.x, p.y - 1, 0xcfd8e6, a * 0.5);
+}
+function drawBalloon(e){
+  const p = project(e.x, e.y, e.z);
+  if (p.depth < 5 || p.depth > 3000) return;
+  const row0 = clamp(p.y | 0, 0, H - 1);
+  if (p.depth > rowDepth[row0]) return;
+  const r = F * e.r / p.depth, bob = Math.sin(rt * 0.9 + e.ph) * 0.6;
+  const a = clamp(1.3 - p.depth / 1500, 0.3, 1);
+  if (r < 1){ pxa(p.x, p.y + bob, 0xd23c3c, 0.8 * a); return; }
+  for (let dy = -r * 1.08 - 1; dy <= r * 1.08 + 1; dy++)
+    for (let dx = -r - 1; dx <= r + 1; dx++){
+      const e2 = (dx*dx) / (r*r) + (dy*dy) / (r*r*1.16);
+      if (e2 > 1) continue;
+      const shade = dx > r * 0.24 && dy < 0 ? 0xff8a70            // sun is ahead-right
+                  : dx < -r * 0.3 || dy > r * 0.45 ? 0x7e1f28 : 0xd23c3c;
+      const al = e2 < 0.7 ? 1 : bay(p.x + dx, p.y + bob + dy) < 0.5 ? 0.85 : 0.2;
+      pxa(p.x + dx, p.y + bob + dy, shade, al * a);
+    }
+  const sl = 2.4 * r, by = p.y + bob + r * 1.05 + sl;
+  line(p.x, p.y + bob + r * 1.05, p.x, by, 0x2c2118, 0.7 * a);
+  pxa(p.x - 1, by, 0x6e4f2e, a); pxa(p.x, by, 0x8a6438, a);
+  pxa(p.x + 1, by, 0x6e4f2e, a); pxa(p.x, by + 1, 0x4c361f, a);
+}
+
+/* ---------- render ---------- */
+const rowDepth = new Float32Array(H);                   // sea/ceiling depth, for occlusion
+function render(){
+  cp = Math.cos(cam.pit); sp_ = Math.sin(cam.pit);
+  const jx = shake ? (Math.random()-0.5) * shake : 0;
+  const jy = shake ? (Math.random()-0.5) * shake : 0;
+  const above = cam.y > 0;
+  const fogK = above ? 300 + cam.y * 1.5 : 90;
+  const sun = projectDir(SUN.x, SUN.y, SUN.z);
+  const sunX = sun.depth > 0 ? sun.x : (SUN.x > 0 ? W * 2 : -W);
+  const glint = new Float32Array(W);
+  for (let x = 0; x < W; x++){ const q = (x - sunX) / 48; glint[x] = Math.exp(-q * q * 0.5); }
+
+  for (let y = 0; y < H; y++){
+    // ray for this row, scaled so the forward component is 1
+    const sy = (y - H/2 + jy) / F;
+    const dY = -(sy * cp + sp_), dZ = -sy * sp_ + cp;
+    const hitSurface = above ? dY < -1e-4 : dY > 1e-4;
+    const tRay = hitSurface ? Math.abs(cam.y / dY) : 0;
+    const wz = cam.z + dZ * tRay;
+    rowDepth[y] = hitSurface ? tRay : 1e9;
+
+    // per-row wave LOD: how much world the pixel covers at that distance
+    let l4 = 0, l5 = 0, fog = 1, cosI = 0, m = 0;
+    if (hitSurface){
+      const magApprox = Math.hypot(dY, dZ, 0.25);
+      const dist = tRay * magApprox;
+      const cell = dist / F;                             // world units per pixel here
+      fog = (1 - Math.exp(-dist / fogK)) * 0.86;
+      cosI = Math.abs(dY) / magApprox;
+      rowDepth[y] = dist;
+
+      /* per-row wave walk: every train's phase is A + B·x along the row, so sin/cos
+         advance by a fixed rotation per pixel instead of calling Math.sin */
+      const dwx = tRay / F, wx0 = cam.x + (jx - W/2) * dwx;
+      for (let k = 0; k < 7; k++){
+        const q = cell * LOD[k], amp = WAVE[k][3] / (1 + q * q);
+        if (k === 4) l4 = 1 / (1 + q * q);                // both are reused for glitter
+        if (k === 5) l5 = 1 / (1 + q * q);                // and whitecaps below
+        if (amp < 0.004) continue;
+        const A = WAVE[k][0] * wx0 + WAVE[k][1] * wz + WAVE[k][2] * t;
+        const B = WAVE[k][0] * dwx;
+        WAMP[m] = amp; WS[m] = Math.sin(A); WC[m] = Math.cos(A);
+        WSB[m] = Math.sin(B); WCB[m] = Math.cos(B); m++;
+      }
+    }
+    const fres = hitSurface ? Math.pow(1 - cosI, 2.6) : 0;
+    const skyGrad = hitSurface ? 0 : clamp(dY / Math.hypot(dY, dZ, 0.2), 0, 1);
+    const deepBase = above ? 0 : lerpStops(UWTR, -cam.y);
+    // quantisation step for this row, and its reciprocal so the write loop can multiply
+    const st = hitSurface ? 9 : 13, istep = 1 / st;
+
+    for (let x = 0; x < W; x++){
+      const dX = (x - W/2 + jx) / F;
+      let c;
+
+      if (!hitSurface && above){
+        /* sky: haze at the horizon up to a deep zenith, plus the sun's glow */
+        c = skyGrad < 0.05 ? mix(HAZE[0], MID, smooth(skyGrad / 0.05))
+                           : mix(MID, ZEN, smooth((skyGrad - 0.05) / 0.22));
+        const q = ((x - sun.x) * 0.9) ** 2 + (y - sun.y) ** 2;
+        if (sun.depth > 0 && q < 82000)
+          c = mix(c, 0xfff6e2, q < 67 ? 1 : Math.min(0.9, 30 / (q * 0.0234 + 5)));
+      } else if (!hitSurface){
+        /* looking down underwater: nothing but the body of the water */
+        c = mix(deepBase, DEEP, clamp(-dY * 0.55, 0, 0.75));
+      } else {
+        const wx = cam.x + dX * tRay;
+        // advance every active train one pixel along the row (see the setup above)
+        let n = 0;
+        for (let k = 0; k < m; k++){
+          n += WAMP[k] * WS[k];
+          const s = WS[k], c2 = WC[k];
+          WS[k] = s * WCB[k] + c2 * WSB[k];
+          WC[k] = c2 * WCB[k] - s * WSB[k];
+        }
+        n *= WNORM;
+        if (above){
+          /* sun-lit surface. `n` doubles as the facing term: crests catch the light,
+             troughs sit in the water's own colour, and steep faces spark. */
+          const lo = mix(SEA_NEAR[0], SEA_FAR[0], fog), hi = mix(SEA_NEAR[1], SEA_FAR[1], fog);
+          c = mix(lo, hi, clamp(0.5 + n * 0.42, 0, 1));
+          c = mix(c, SHAZE, 0.08 + 0.6 * fres * fog);
+          // glitter: only the tops of crests inside the sun's road, dithered to specks
+          const spec = Math.pow(clamp(n - 0.62, 0, 1), 2.4) * glint[x] * (l4 * 0.6 + 0.4);
+          if (spec > 0.02 && hashWorld(wx * 4, wz * 4) < spec * 1.15) c = mix(c, FOAM[0], 0.8);
+          if (n > 1.05 && l5 > 0.4 && hashWorld(wx * 3 + 91, wz * 3 - 57) < (n - 1.05) * 1.6)
+            c = FOAM[1];                                                       // whitecap
+          c = mix(c, SHAZE, fog * fog * 0.3);
+        } else {
+          /* the surface seen from below: caustics, Snell's window, then haze */
+          const up2 = Math.abs(dY) / Math.hypot(dX, dY, dZ);
+          const caus = Math.pow(clamp(0.5 + n * 0.5, 0, 1), 3);
+          c = mix(deepBase, 0xcfeefa, (0.28 + 0.8 * caus) * Math.max(0, 1 - tRay / 1100));
+          if (up2 > 0.86) c = mix(c, 0xe9f7ff, smooth((up2 - 0.86) / 0.12) * 0.5);
+          c = mix(c, deepBase, clamp(tRay / 1200, 0, 0.85));
+        }
+        /* splash geometry lives in world space, so perspective is free */
+        if (patch && patch.life > 0){
+          const dx = wx - patch.x, dz = wz - patch.z, rr = Math.hypot(dx, dz);
+          if (rr < patch.r){
+            const e = rr / patch.r, a = patch.life * (0.95 - e * 0.55) * (above ? 1 : 0.7);
+            if (hashWorld(wx * 2.5 + 13, wz * 2.5 + 29) < a) c = e > 0.7 ? FOAM[2] : FOAM[0];
+          }
+        }
+        for (let i = 0; i < rings.length; i++){
+          const r = rings[i], dx = wx - r.x, dz = wz - r.z;
+          const rr = Math.hypot(dx, dz), d = Math.abs(rr - r.r);
+          if (d < r.w){
+            const a = r.life * (1 - d / r.w) * (above ? 0.95 : 0.6);
+            if (bay(x, y) < a) c = mix(c, FOAM[rr > r.r ? 2 : 0], 0.9);
+          }
+        }
+      }
+
+      // dither on write — this is what gives the gradients their banded look
+      const d = bay(x, y), i4 = (y * W + x) << 2;
+      D[i4]   = Math.min(255, ((c>>16&255) * istep + d | 0) * st);
+      D[i4+1] = Math.min(255, ((c>>8&255)  * istep + d | 0) * st);
+      D[i4+2] = Math.min(255, ((c&255)     * istep + d | 0) * st);
+    }
+  }
+
+  /* clouds — billboarded puffs, so falling past them sells the altitude */
+  if (above){
+    const list = clouds.map(c => ({ c, d: -((c.y - cam.y) * sp_) + (c.z - cam.z) * cp }))
+                       .filter(o => o.d > 6).sort((a, b) => b.d - a.d);
+    for (const { c } of list) for (const bl of c.blobs){
+      const p = project(c.x + bl.ox, c.y + bl.oy, c.z + bl.oz);
+      if (p.depth < 6) continue;
+      const r = F * bl.r / p.depth;
+      if (r < 0.7 || r > 192) continue;
+      // near ones dissolve instead of becoming a hard white disc across the lens
+      const fade = clamp(1 - p.depth / 2600, 0.12, 1) * smooth((p.depth - 70) / 130);
+      if (fade < 0.02) continue;
+      for (let dy = -r * 0.62 - 1; dy <= r * 0.62 + 1; dy++)
+        for (let dx = -r - 1; dx <= r + 1; dx++){
+          const e = (dx*dx)/(r*r) + (dy*dy)/(r*r*0.42);
+          if (e > 1) continue;
+          const yy = p.y + dy | 0;
+          if (yy < 0 || yy >= H || p.depth > rowDepth[yy]) continue;
+          const shade = dy > r * 0.18 ? 0xa4c2da : (dy < -r * 0.22 ? 0xffffff : 0xe6f2fb);
+          const b = bay(p.x + dx, yy);                  // dithered rim, feathered in two steps
+          const a = e < 0.46 ? 0.95 : e < 0.78 ? (b < 0.7 ? 0.8 : 0.3) : (b < 0.34 ? 0.55 : 0);
+          pxa(p.x + dx, yy, shade, a * fade);
+        }
+    }
+    /* punching through a cloud deck: whiteout rather than a disc across the lens */
+    let wo = 0;
+    for (const c of clouds){
+      const d = Math.hypot(c.x - cam.x, (c.y - cam.y) * 1.8, c.z - cam.z);
+      if (d < 55) wo = Math.max(wo, 1 - d / 55);
+    }
+    if (wo > 0.02)
+      for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) pxa(x, y, HAZE[1], wo * 0.8);
+
+    /* rushing air: each speck streaked along its own motion, not screen-vertical */
+    if (mode === 'fall'){
+      const spd = Math.min(1, man.vy / VMAX), dtr = 0.013 * spd;
+      for (const s of specks){
+        const a = project(s.x, s.y, s.z);
+        if (a.depth < 3) continue;
+        const b = project(s.x, s.y + man.vy * dtr, s.z);
+        if (Math.abs(a.y - b.y) > 144) continue;
+        line(a.x, a.y, b.x, b.y, 0xffffff, 0.26 * spd * spd * clamp(1 - a.depth / 80, 0, 1));
+      }
+    }
+
+    /* the course: farthest gates first so the near ones overdraw them */
+    const vis = gates.filter(e => !e.dead && (e.y < man.y - 2 || e.pop > 0))
+                     .sort((a, b) => a.y - b.y);
+    for (const e of vis){
+      if (e.kind === 'ring') drawGate(e);
+      else if (e.kind === 'bird') drawBird(e);
+      else drawBalloon(e);
+    }
+  }
+
+  /* sparks — ring pops, feathers, balloon shreds */
+  for (const s of sparks){
+    const p = project(s.x, s.y, s.z);
+    if (p.depth < 3) continue;
+    const a = s.life * 0.9 * clamp(1 - p.depth / 700, 0.1, 1);
+    pxa(p.x, p.y, s.c, a);
+    if (s.life > 0.6) pxa(p.x, p.y - 1, s.c, a * 0.5);
+  }
+
+  /* underwater dressing */
+  if (!above){
+    const shaft = 0.15 * Math.max(0, 1 + cam.y / 600);
+    let deep0 = H;                                       // first row of open water
+    for (let y = 0; y < H; y++) if (rowDepth[y] >= 1e8){ deep0 = y; break; }
+    if (shaft > 0.004) for (let i = 0; i < 5; i++){
+      const bx = sun.x * 0.5 + W * 0.25 + (i - 2) * 34, w = 9.6 + i * 2.6;
+      const amp = shaft * (0.75 + 0.25 * Math.sin(t * 1.1 + i));
+      for (let y = deep0; y < H; y++){
+        if (rowDepth[y] < 1e8) continue;                 // don't lay them over the surface
+        const g = amp * smooth((y - deep0) / 42);        // fade in, or the tops read as a box
+        for (let dx = -w; dx <= w; dx++){
+          const f = 1 - Math.abs(dx) / w;
+          pxAdd(bx + dx + y * 0.22, y, 0x9fe4ff, g * f * f * (bay(bx+dx, y) < 0.7 ? 1 : 0.3));
+        }
+      }
+    }
+    for (const s of snow){
+      const p = project(s.x + Math.sin(t * 0.4 + s.ph) * 3, s.y, s.z);
+      if (p.depth < 2 || p.depth > 140) continue;
+      const a = 0.45 * (1 - p.depth / 140) * Math.max(0.25, 1 + (cam.y + 40) / 600);
+      pxa(p.x, p.y, 0xd8f2ff, a);
+      if (s.r) pxa(p.x, p.y + 1, 0xd8f2ff, a * 0.6);
+    }
+  }
+
+  /* the diver */
+  const pm = project(man.x, man.y, man.z);
+  if (pm.depth > 4){
+    /* scale locked to 1 while airborne — one sprite pixel is one frame pixel; he only
+       shrinks once he recedes underwater (see third-person/README.md) */
+    const scale = mode !== 'water' ? 1 : Math.max(0.26, SPRITE_K * F / pm.depth);
+    let fade = mode !== 'water' ? 0 : clamp(-man.y / 620, 0, 0.8), tint;
+    if (above && man.y < 0){                             // seen through the surface
+      fade = Math.max(fade, clamp(0.4 + -man.y / 90, 0.4, 0.92));
+      tint = 0x1d6d90;
+    }
+    drawSprite(POSE[man.pose], pm.x, pm.y, man.ang, scale, fade, tint);
+  }
+
+  /* airborne droplets, then bubbles last so the near ones sit over everything */
+  for (const d of drops){
+    const p = project(d.x, d.y, d.z);
+    if (p.depth < 3) continue;
+    const c = d.big ? FOAM[0] : FOAM[1];
+    pxa(p.x, p.y, c, 0.92);
+    if (d.big){ pxa(p.x, p.y - 1, FOAM[1], 0.6); pxa(p.x + 1, p.y, FOAM[2], 0.5); }
+  }
+  if (!above) for (const b of bubbles){
+    const p = project(b.x, b.y, b.z);
+    if (p.depth < 1.2) continue;
+    const r = F * b.r / p.depth;
+    const a = b.a * clamp(1 - p.depth / 110, 0.15, 1);
+    if (r < 1.8){ pxa(p.x, p.y, 0xdff4ff, 0.7 * a); continue; }
+    for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++){
+      const e = (dx*dx + dy*dy) / (r*r);
+      if (e > 1) continue;
+      if (e > 0.55) pxa(p.x + dx, p.y + dy, 0xcdefff, 0.65 * a * (dy < 0 ? 1 : 0.6));
+      else pxa(p.x + dx, p.y + dy, 0xa8dcf0, 0.16 * a);
+    }
+  }
+
+  /* depth vignette, the through-the-surface flash, then the closing fade */
+  if (!above){
+    const v = clamp(-cam.y / 900, 0, 0.45);
+    for (let y = 0; y < H; y++){
+      const ey = (y - H/2) / (H/2), ey2 = ey * ey;
+      for (let x = 0; x < W; x++){
+        const ex = (x - W/2) / (W/2);
+        pxa(x, y, DEEP, clamp(v + (ex * ex + ey2) * 0.28, 0, 0.8));
+      }
+    }
+  }
+  if (flash > 0.01)
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) pxa(x, y, 0xeaf8ff, flash * 0.72);
+  const tail = mode === 'water' ? rt - impactRT : 0;
+  if (tail > 7.5){
+    const a = Math.min(1, (tail - 7.5) / 2.4);
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) pxa(x, y, 0x000000, a);
+  }
+
+  oc.putImageData(img, 0, 0);
+  vc.drawImage(off, 0, 0, view.width, view.height);
+}
+
+/* ---------- loop (slow-motion kicks in on impact) ---------- */
+let last = performance.now();
+function frame(now){
+  const rdt = Math.min(0.05, (now - last) / 1000); last = now;
+  let dt = rdt;
+  if (mode === 'water') dt *= 1 - 0.76 * Math.min(1, (t - impactT) / 0.45);
+  update(dt, rdt);
+  render();
+  hudUpdate();
+  windUpdate(rdt);
+  requestAnimationFrame(frame);
+}
+/* dev hooks: #t=4.2 steps the sim (no input) 4.2 real seconds in, renders that one
+   frame and freezes — rAF under headless Chrome's --virtual-time-budget fires with
+   multi-second dt jumps, so a running loop is useless for screenshots.
+   #seed=N pins the course layout. */
+function seek(secs){
+  const step = 1 / 120;
+  for (let s = 0; s < secs; s += step){
+    let dt = step;
+    if (mode === 'water') dt *= 1 - 0.76 * Math.min(1, (t - impactT) / 0.45);
+    update(dt, step);
+  }
+}
+const mSeed = /seed=(\d+)/.exec(location.hash);
+reset(mSeed ? +mSeed[1] : 20260725);
+const mT = /t=([\d.]+)/.exec(location.hash);
+if (mT){
+  mode = 'fall'; hud.hidden = false;
+  seek(+mT[1]);
+  hudUpdate();
+  // repaint without ever updating: one still, but with frames the compositor can grab
+  (function paint(){ render(); requestAnimationFrame(paint); })();
+  hint.textContent =
+    `rt=${rt.toFixed(2)} t=${t.toFixed(2)} pose=${man.pose} h=${man.y.toFixed(0)} ` +
+    `cam=${cam.y.toFixed(0)} pit=${cam.pit.toFixed(2)} mode=${mode} score=${score}`;
+} else {
+  mode = 'title';
+  showTitle();
+  requestAnimationFrame(frame);
+}
+</script>
+<script>
+/* anonymous visit beacon — counts loads + presence heartbeats, no cookies */
+(function(){
+  if (location.protocol === "file:" || location.hostname === "localhost") return;
+  var EP = "https://site-analytics.vaibhavpro9210.workers.dev/ping";
+  var sid = sessionStorage.getItem("va_sid");
+  if (!sid) { sid = Math.random().toString(36).slice(2) + Date.now().toString(36); sessionStorage.setItem("va_sid", sid); }
+  function send(kind){
+    try { navigator.sendBeacon(EP, new Blob([JSON.stringify({sid:sid, page:location.pathname, kind:kind})], {type:"text/plain"})); } catch(e){}
+  }
+  send("load");
+  setInterval(function(){ if (document.visibilityState === "visible") send("beat"); }, 60000);
+})();
+</script>

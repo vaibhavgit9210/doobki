@@ -86,17 +86,36 @@
 <body>
 <div class="wrap">
 
-  <p class="kicker">doobki · render tests</p>
-  <h1>One scene, <em>three ways</em> of looking at it.</h1>
-  <p class="lede">Look-development for a game I haven't built yet. A man falls out of the sky and
-  sinks — rendered once as <strong>pixel art</strong> and once as <strong>smooth vector</strong> —
-  plus a <strong>low-poly 3D</strong> study of the art style a real game would ship in. Each one is
-  a single HTML file: no build step, no libraries, no network calls.</p>
+  <p class="kicker">doobki · render tests → a game</p>
+  <h1>One scene, <em>four ways</em> of looking at it — then a game.</h1>
+  <p class="lede">Look-development that finally became the thing it was auditioning for. A man
+  falls out of the sky and sinks — rendered as <strong>pixel art</strong>, as
+  <strong>smooth vector</strong>, and again in pixel art with the camera
+  <strong>behind him</strong> — plus a <strong>low-poly 3D</strong> study, and now
+  <strong>the game itself</strong>, built on the third-person renderer. Each one is a single
+  HTML file: no build step, no libraries, no network calls.</p>
 
-  <p class="note">These are deliberately just visuals — no gameplay, no state, nothing to win.
-  The point was to find out how far the look could be pushed before committing to an engine.</p>
+  <p class="note">Views 01–04 are deliberately just visuals — no gameplay, no state, nothing to
+  win. The point was to find out how far the look could be pushed before committing to an engine.
+  View 05 is the commitment.</p>
 
   <div class="grid">
+
+    <a class="card lead" href="game/">
+      <span class="shot"><img src="previews/game.png" alt="Pixel-art view from behind a skydiver high over the sea, with a gold ring and a red balloon on the course below" width="1152" height="864"></span>
+      <div class="body">
+        <span class="num">05 / the game</span>
+        <h2>Doobki</h2>
+        <p class="sub">steer the fall · thread the rings · dodge everything</p>
+        <p>Fall from 6000 units up with the camera over your shoulder. Steer left and right to
+        thread the gold rings — each one grows the combo — and dodge the birds and balloons that
+        break it, then take the splash. Built on the third-person renderer: same raycast sea,
+        same sprite, but the camera pitches down to show you the course, and eases back to the
+        cinematic framing for the entry.</p>
+        <div class="tags"><span>arrow keys / touch</span><span>combo scoring</span><span>synth audio</span></div>
+        <span class="go">play ↗</span>
+      </div>
+    </a>
 
     <a class="card lead" href="pixel-fall/">
       <span class="shot"><img src="previews/pixel-fall.png" alt="Pixel-art water splash with a dithered blue sky above and foam along the wavy surface" width="1000" height="590"></span>
@@ -138,6 +157,21 @@
         wireframe, terrain density. Faceted shading comes from screen-space derivatives, so
         every triangle reads as one hard plane.</p>
         <div class="tags"><span>GLSL 300 es</span><span>dFdx/dFdy normals</span><span>~8k tris</span></div>
+        <span class="go">open ↗</span>
+      </div>
+    </a>
+
+    <a class="card lead" href="third-person/">
+      <span class="shot"><img src="previews/third-person.png" alt="Pixel-art third-person view from behind a skydiver falling toward a wide blue sea, with a cloud deck below and a low sun" width="384" height="288"></span>
+      <div class="body">
+        <span class="num">04 / pixel art, from behind</span>
+        <h2>Skyfall, Third Person</h2>
+        <p class="sub">raycast sea plane · one shared camera</p>
+        <p>View 01 again from over his shoulder, which turns out to need a different renderer
+        entirely: the water is a per-pixel raycast onto a plane, so it has a horizon, the splash
+        rings come out as ellipses, and he shrinks as he sinks away from you. A 384×288 dithered
+        buffer, with the poses drawn at the size they appear so his pixels are the frame's pixels.</p>
+        <div class="tags"><span>plane raycast</span><span>wave LOD</span><span>1:1 sprite pixels</span></div>
         <span class="go">open ↗</span>
       </div>
     </a>
