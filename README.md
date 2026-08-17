@@ -22,7 +22,7 @@ calls; they work offline and under a strict CSP.
 | 04 | [`third-person/`](third-person/) | pixel art, from behind | camera over his shoulder, so the sea is a raycast plane with a horizon — [README](third-person/README.md) |
 | 05 | [`game/`](game/) | **the game** | steer the fall, thread rings, dodge birds & balloons, combo scoring — [README](game/README.md) |
 
-`index.html` at the root is the hub that links all four, with preview stills in
+`index.html` at the root is the hub that links all five, with preview stills in
 `previews/`.
 
 ## Why two takes on the same scene
